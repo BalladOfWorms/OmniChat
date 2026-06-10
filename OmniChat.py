@@ -589,84 +589,10 @@ if _box_opacity_pct() < 100:
 _chat_options_button_rect = None
 _options_popup_open  = False
 
-# ── Character dropdown (multibox pin switcher) ─────────────────────────
-# A header button showing which character's chat the panel is pinned to.
-# Clicking lists every character the overlay has seen this session
-# (senders accumulate even while gated) plus an Auto entry; picking one
-# writes chat_main_char so the multibox gate repins instantly and the
-# choice persists. Single-box it simply shows your character's name.
-_char_dropdown_open  = False
-_chat_char_button_rect = None
-_char_dropdown_rects = []        # [(rect, name_or_None)] None = Auto
-
-
-def draw_char_dropdown(surface):
-    """Multibox pin switcher popup, anchored under the character
-    button. Lists Auto (follow latest heartbeat) + every character
-    seen this session; the active pin gets a check + accent."""
-    global _char_dropdown_rects
-    _char_dropdown_rects = []
-    if not _char_dropdown_open:
-        return
-    f = _chat_get_font("meta", 11)
-    chars = list_known_characters()
-    rows = [(None, "Auto (latest login)")] + [(c, c) for c in chars]
-    row_h, pad = 22, 6
-    p_w = max([f.size(lbl)[0] for _, lbl in rows] + [120]) + 36
-    p_h = pad * 2 + row_h * len(rows)
-    win_w, win_h = chat_panel_size()
-    btn = _chat_char_button_rect
-    px = (btn.x if btn else 8)
-    px = max(2, min(px, win_w - p_w - 2))
-    py = (btn.bottom + 2 if btn else 20)
-    py = max(2, min(py, win_h - p_h - 2))
-    panel = pygame.Rect(px, py, p_w, p_h)
-    s = pygame.Surface((p_w, p_h), pygame.SRCALPHA)
-    s.fill((24, 28, 36, 248))
-    surface.blit(s, panel.topleft)
-    pygame.draw.rect(surface, (90, 105, 125), panel, 1)
-    _char_dropdown_rects.append((panel, "__bg__"))
-
-    explicit = (setting("chat_main_char") or "").strip()
-    target = _mb_chat_lock_target() or ""
-    for i, (val, lbl) in enumerate(rows):
-        r = pygame.Rect(px + 2, py + pad + i * row_h, p_w - 4, row_h - 2)
-        hov = r.collidepoint(pygame.mouse.get_pos())
-        is_active = ((val is None and not explicit)
-                     or (val is not None and val == explicit))
-        if hov or is_active:
-            hs = pygame.Surface((r.w, r.h), pygame.SRCALPHA)
-            hs.fill((70, 60, 38, 200) if is_active else (55, 65, 82, 200))
-            surface.blit(hs, r.topleft)
-        mark = "✓ " if is_active else ("• " if (val and val == target
-                                                and not explicit) else "  ")
-        color = ((245, 225, 180) if is_active
-                 else ((235, 235, 240) if hov else (195, 205, 215)))
-        surface.blit(f.render(mark + lbl, True, color), (r.x + 8, r.y + 4))
-        _char_dropdown_rects.append((r, val))
-
-
-def dispatch_char_dropdown_click(mx, my):
-    """Returns True when the click was consumed by the dropdown."""
-    global _char_dropdown_open
-    if not _char_dropdown_open:
-        return False
-    for rect, val in reversed(_char_dropdown_rects):
-        if not rect.collidepoint(mx, my):
-            continue
-        if val == "__bg__":
-            return True                    # chrome click: keep open
-        set_setting("chat_main_char", val or "")
-        _char_dropdown_open = False
-        return True
-    # Click on the character button itself: close + consume (same
-    # dismiss-then-retoggle bug as the Options button).
-    if _chat_char_button_rect is not None \
-            and _chat_char_button_rect.collidepoint(mx, my):
-        _char_dropdown_open = False
-        return True
-    _char_dropdown_open = False            # outside: dismiss
-    return False                           # ...and fall through
+# Multibox pin switching lives in the Options popup ("Pin character"
+# stepper) — it cycles Auto → every character seen this session and
+# persists as chat_main_char. (A header dropdown variant existed
+# briefly in 1.0.1 development and was folded into Options.)
 _options_popup_rects = []      # list of (Rect, action_str)
 
 _FONT_SIZE_ORDER = ["small", "medium", "large"]
@@ -5438,34 +5364,6 @@ def draw_chat_panel(surface, x, y, locked=False):
     _chat_clear_all_button_rect = _draw_hdr_button(
         "Clear All", _chat_clear_tab_button_rect.right + _gap, _clr_all_w)
 
-    # Character pin button — shows whose chat the panel is showing.
-    # Drawn whenever any character is known (single-box included: it
-    # reads as an identity badge there). Amber-tinted when the pin is
-    # an explicit chat_main_char rather than auto-follow.
-    global _chat_char_button_rect
-    _chat_char_button_rect = None
-    _pin_target = _mb_chat_lock_target() or ""
-    if _pin_target or list_known_characters():
-        _pin_label = _pin_target or "—"
-        _pinned_explicit = bool((setting("chat_main_char") or "").strip())
-        _chr_w = title_font.size(_pin_label)[0] + 18
-        _chr_r = pygame.Rect(_chat_clear_all_button_rect.right + _gap * 2,
-                             y + 1, _chr_w, gear_h)
-        hov = _chr_r.collidepoint(mouse_pos)
-        s = pygame.Surface((_chr_r.width, _chr_r.height), pygame.SRCALPHA)
-        s.fill((70, 60, 38, 225) if (_pinned_explicit or hov)
-               else (40, 46, 56, 200))
-        surface.blit(s, _chr_r.topleft)
-        pygame.draw.rect(surface,
-                         (200, 165, 90) if _pinned_explicit
-                         else (95, 110, 130), _chr_r, 1)
-        t = title_font.render(_pin_label, True,
-                              (245, 225, 180) if _pinned_explicit
-                              else ((240, 240, 240) if hov
-                                    else (190, 200, 210)))
-        surface.blit(t, (_chr_r.x + (_chr_r.width - t.get_width()) // 2,
-                         _chr_r.y + (_chr_r.height - t.get_height()) // 2))
-        _chat_char_button_rect = _chr_r
 
     # "Show all tabs" — anchored to the right side of the header,
     # just LEFT of the Filters gear button (which is right-edge
@@ -6588,13 +6486,6 @@ while _running:
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mx, my = event.pos
 
-            # Character dropdown: same routing contract as the
-            # options popup (consume inside, dismiss + fall through
-            # outside).
-            if _char_dropdown_open:
-                if dispatch_char_dropdown_click(mx, my):
-                    continue
-
             # Options popup: if open, route the click through it first
             # (a row action consumes; outside dismisses + falls through).
             if _options_popup_open:
@@ -6764,11 +6655,6 @@ while _running:
                 _options_popup_open = not _options_popup_open
                 continue
 
-            # Character pin button → toggle the multibox dropdown.
-            if _chat_char_button_rect is not None \
-               and _chat_char_button_rect.collidepoint(mx, my):
-                _char_dropdown_open = not _char_dropdown_open
-                continue
 
             # Composer clicks — channel arrows, send, field focus.
             if chat_composer_visible:
@@ -6994,7 +6880,6 @@ while _running:
     draw_resize_grip(screen, _w, _h)
     draw_chat_tab_rclick_popup(screen)
     draw_options_popup(screen)
-    draw_char_dropdown(screen)
 
     pygame.display.flip()
     _clock.tick(60)
