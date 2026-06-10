@@ -1,6 +1,4 @@
 # OmniChat
-Standalone chat panel from OmniWatch
-# OmniChat
 
 Standalone FFXI chat panel — OmniWatch's chat subsystem extracted into
 its own Windower addon + pygame overlay. Same routing rules, filter
@@ -153,8 +151,21 @@ wire format is unchanged from OmniWatch's.
 
 ## Multiboxing
 
-`chat/drain.lua` tags every datagram with `@CharName@`. When two
-characters are logged in, the overlay pins chat to the character named
-in the `chat_main_char` setting (edit `omnichat_settings.json`); when
-unset, it follows whichever character's JOB heartbeat arrived most
-recently.
+`chat/drain.lua` tags every datagram with `@CharName@`, and the overlay
+**pins to one character** so the same /say overheard by two logged-in
+clients doesn't appear twice. The pin is shown as a **character button
+in the header** (after Clear All): click it for a dropdown listing every
+character seen this session plus **Auto (latest login)**. Picking a name
+pins chat to that character instantly and persists (`chat_main_char` in
+`omnichat_settings.json`); the button turns amber when an explicit pin
+is active, and Auto follows whichever character's heartbeat arrived
+first after the overlay started. The same switcher is available as a
+**Pin character** stepper in the Options popup.
+
+Two things to know:
+- **The composer is separate from the pin.** Typed sends go out through
+  whichever game client bound port 5111 first (normally the first one
+  launched). If you reload the addon on another box, sends can migrate
+  there while the pin stays put.
+- Tells received by a **non-pinned** character don't appear; switch the
+  pin (or check that client's native log) to read them.

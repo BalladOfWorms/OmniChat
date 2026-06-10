@@ -31,8 +31,8 @@
 --   //oc class <id>    classify a mob id (diagnostic)
 
 _addon.name     = 'OmniChat'
-_addon.author   = 'BalladOfWorms'
-_addon.version  = '1.0.0'
+_addon.author   = 'Cooper (BalladOfWorms)'
+_addon.version  = '1.0.1'
 _addon.commands = {'omnichat', 'oc'}
 
 local socket = require('socket')
