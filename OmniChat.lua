@@ -31,8 +31,8 @@
 --   //oc class <id>    classify a mob id (diagnostic)
 
 _addon.name     = 'OmniChat'
-_addon.author   = 'Cooper (BalladOfWorms)'
-_addon.version  = '1.0.1'
+_addon.author   = 'BalladOfWorms'
+_addon.version  = '1.0.3'
 _addon.commands = {'omnichat', 'oc'}
 
 local socket = require('socket')
@@ -713,52 +713,39 @@ end)
 -- command (the composer sends "input /p hello", the name context menu
 -- sends "input /pcmd add Name"). Mirrors OmniWatch's legacy bare-
 -- command mode on its 5011 listener.
--- ── Auto-translate ENCODING for composer sends ────────────────────────────
--- The composer lets you write {Yes, please.} style phrases; before the
--- text reaches the game we swap each {…} whose contents match an
--- auto-translate phrase (case-insensitive, English or Japanese) for
--- the real 6-byte token the game uses:
---   FD 02 02 <id_hi> <id_lo> FD        (id = res.auto_translates key)
--- This is the exact inverse of the incoming decode in
--- chat/chat_packets.lua / _oc_resolve_outgoing_at above, so what you
--- see in the panel is what you can type. Unmatched {…} text is left
--- literally as typed (harmless). The name→id map is built lazily on
--- first use (~600 entries, one-time).
-local _oc_at_name_to_id = nil
+-- ── NPC dialog "continue" arrow support ───────────────────────────────
+-- FFXI marks NPC dialog / cutscenes with player status 4 (Event). We
+-- watch it (~2 Hz in prerender, throttled) and report changes to the
+-- overlay as 'CSSTATE\t1|0' (multibox-tagged), with a periodic refresh
+-- feeding the overlay's freshness window. The overlay shows a pulsing
+-- continue arrow at the end of the last chat line while the pinned
+-- character is in this state.
+local _oc_cs_last_sent = nil
+local _oc_cs_next_poll = 0
+local _oc_cs_next_refresh = 0
 
-local function _oc_build_at_index()
-    _oc_at_name_to_id = {}
-    if not (res and res.auto_translates) then return end
-    for id, entry in pairs(res.auto_translates) do
-        if type(entry) == 'table' then
-            if type(entry.en) == 'string' and entry.en ~= '' then
-                _oc_at_name_to_id[entry.en:lower()] = id
-            end
-            if type(entry.ja) == 'string' and entry.ja ~= '' then
-                _oc_at_name_to_id[entry.ja:lower()] = id
-            end
-        end
-    end
+local function _oc_in_event()
+    local p = windower.ffxi.get_player()
+    return p ~= nil and p.status == 4
 end
 
-local function _oc_encode_at(text)
-    -- Returns (encoded_text, n_replaced).
-    if not text or not text:find('{', 1, true) then return text, 0 end
-    if _oc_at_name_to_id == nil then
-        pcall(_oc_build_at_index)
-        _oc_at_name_to_id = _oc_at_name_to_id or {}
-    end
-    local n_hit = 0
-    local out = text:gsub('{(.-)}', function(name)
-        local id = _oc_at_name_to_id[(name or ''):lower()]
-        if not id then
-            return '{' .. name .. '}'        -- not a phrase: keep literal
+local function _oc_poll_cs_state()
+    local now = os.clock()
+    if now < _oc_cs_next_poll then return end
+    _oc_cs_next_poll = now + 0.5
+    local on = _oc_in_event()
+    if on ~= _oc_cs_last_sent or now >= _oc_cs_next_refresh then
+        _oc_cs_last_sent = on
+        _oc_cs_next_refresh = now + 2.0
+        local p = windower.ffxi.get_player()
+        local name = (p and p.name) or ''
+        if udp_chat and name ~= '' then
+            pcall(function()
+                udp_chat:send('@' .. name .. '@CSSTATE\t'
+                              .. (on and '1' or '0'))
+            end)
         end
-        n_hit = n_hit + 1
-        return string.char(0xFD, 0x02, 0x02,
-                           math.floor(id / 256) % 256, id % 256, 0xFD)
-    end)
-    return out, n_hit
+    end
 end
 
 local function _oc_drain_inbound()
@@ -780,18 +767,7 @@ local function _oc_drain_inbound()
             -- game; send_command's parser is not byte-safe for them).
             -- Plain messages keep the original send_command path
             -- byte-for-byte, so existing behavior is unchanged.
-            local payload = data:match('^input%s+(.+)$')
-            if payload and payload:find('{', 1, true) then
-                local encoded, n_hit = _oc_encode_at(payload)
-                if n_hit > 0 and windower.chat
-                        and windower.chat.input then
-                    windower.chat.input(encoded)
-                else
-                    windower.send_command(data)
-                end
-            else
-                windower.send_command(data)
-            end
+            windower.send_command(data)
         end
     end
 end
@@ -809,6 +785,8 @@ local _oc_last_drain_ts = 0     -- os.time() of last non-empty drain
 oc_safe_register('prerender', function()
     -- Inbound commands every frame (cheap; usually empty).
     pcall(_oc_drain_inbound)
+    -- Cutscene-status poll for the dialog pad (self-throttled 2 Hz).
+    pcall(_oc_poll_cs_state)
 
     _oc_drain_acc = _oc_drain_acc + 1
     if _oc_drain_acc >= 6 then        -- ~60 Hz prerender → ~10 Hz drain

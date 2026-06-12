@@ -84,6 +84,10 @@ The header's **Options** button opens a popup with:
   to the game the moment you send (Enter) or cancel (Esc). Mouse-wheel
   scrolling over the unfocused panel works on Windows 10/11 ("scroll
   inactive windows", on by default).
+- **Type anywhere** (default ON) — type into the composer without
+  clicking the panel at all; see the section below. With this on you
+  rarely need to click into the composer — the game keeps focus the
+  whole time.
 - **Exit OmniChat** — the borderless window has no [X]; this and
   Ctrl+Q are the two ways out.
 
@@ -98,19 +102,43 @@ left-click a sender name to set up a /tell, right-click for the
 Tell / Invite / Blacklist context menu, and the composer row with
 channel cycling and slash-command escape.
 
-## Auto-translate in the composer
+## NPC dialog "continue" arrow
 
-Wrap a phrase in curly braces — `Need help? {Yes, please.}` — and it
-sends as the real in-game auto-translate token. The **{ } button** in
-the composer row does the wrapping for you: with text typed, one
-click wraps the whole message (click again to unwrap); with an empty
-field it inserts `{}` and parks the cursor inside so you just type
-the phrase. Either way the message sends as the token (visible to JP players
-in Japanese, exactly like using Tab in the native chat). Matching is
-case-insensitive against the full auto-translate list, English or
-Japanese names. Incoming auto-translate already renders as `{phrase}`
-in the panel, so you can copy any phrase you see straight into the
-composer. Text in braces that isn't a real phrase is sent literally.
+While your character is in a cutscene or NPC dialog (the game's Event
+status), a small pulsing **▼** appears at the end of the last chat
+line — the panel's version of the game's blinking continue cursor.
+There's more to read; hit Enter in the game to advance. The arrow
+follows the character the panel is pinned to, only draws at the live
+bottom of the scrollback, and disappears a few seconds after the
+dialog ends.
+
+## Type anywhere (global typing)
+
+With the **Type anywhere** toggle ON (Options popup), every keystroke
+you make *while the game window is focused* goes into OmniChat's
+composer instead of the game — no clicking the panel, no focus change:
+
+- **Enter** sends the line and keeps capturing (rapid-fire several
+  lines in a row).
+- **Esc** clears the current draft and keeps capturing.
+- Alt-tabbing or clicking another app pauses capture automatically
+  (your draft is preserved); refocusing the game resumes it.
+- The **toggle is the only off switch** — flip it OFF to play
+  normally and type in-game; the composer then works click-to-type
+  as before.
+
+The trade is deliberate: while the toggle is ON you can't use FFXI's
+own keyboard (its `/` chat, keyboard hotbars, movement keys) — the
+toggle is your instant way back.
+
+> **Run OmniChat as administrator if Windower runs elevated.**
+> Windows (UIPI) silently blocks a normal-privilege keyboard hook
+> from seeing input destined for an elevated window: the feature
+> reports ready but captures nothing. OmniChat detects the mismatch
+> and prints an advisory in the session log. Either elevate OmniChat
+> too (Properties → Compatibility → "Run this program as an
+> administrator" makes it permanent), or run Windower un-elevated.
+
 
 ## In-game commands
 
@@ -138,6 +166,8 @@ omnichat_settings.json            window pos/size, hidden tabs, font size,
                                   chat main character (multibox pin)
 omnichat_chat_routing.json        global routing config
 omnichat_chat_routing-<JOB>.json  per-job overrides
+logs/session_*.log                console output of windowed builds
+                                  (rotating, last 5 kept)
 ```
 
 ## Porting fixes between OmniWatch and OmniChat
@@ -153,14 +183,12 @@ wire format is unchanged from OmniWatch's.
 
 `chat/drain.lua` tags every datagram with `@CharName@`, and the overlay
 **pins to one character** so the same /say overheard by two logged-in
-clients doesn't appear twice. The pin is shown as a **character button
-in the header** (after Clear All): click it for a dropdown listing every
-character seen this session plus **Auto (latest login)**. Picking a name
-pins chat to that character instantly and persists (`chat_main_char` in
-`omnichat_settings.json`); the button turns amber when an explicit pin
-is active, and Auto follows whichever character's heartbeat arrived
-first after the overlay started. The same switcher is available as a
-**Pin character** stepper in the Options popup.
+clients doesn't appear twice. Switch the pin with the **Pin character**
+stepper in the Options popup: it cycles **Auto (latest login)** and
+every character seen this session. Picking one pins chat to that
+character instantly and persists (`chat_main_char` in
+`omnichat_settings.json`); Auto follows whichever character's heartbeat
+arrived first after the overlay started.
 
 Two things to know:
 - **The composer is separate from the pin.** Typed sends go out through

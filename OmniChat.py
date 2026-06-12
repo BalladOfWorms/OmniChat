@@ -44,7 +44,7 @@ import collections as _collections
 
 import pygame
 
-OMNICHAT_VERSION = "1.0.1"
+OMNICHAT_VERSION = "1.0.3"
 
 # ── Config / settings ──────────────────────────────────────────────────────
 # One flat JSON file. Mirrors the keys OmniWatch's chat panel reads so
@@ -117,6 +117,12 @@ SETTINGS_SCHEMA = [
     {"key": "window_pos",       "default": None},       # [x, y] or None
     {"key": "chat_panel_dims",  "default": [800, 280]},
     {"key": "chat_composer_visible", "default": True},
+    {"key": "global_typing",     "default": True},    # type-anywhere capture
+    {"key": "global_typing_key", "default": "grave"},  # trigger key name (` key)
+    {"key": "global_typing_mod", "default": ""},      # "", ctrl, alt, shift
+    {"key": "global_typing_strict", "default": False}, # require FFXI id
+    {"key": "global_typing_trace",  "default": False}, # log the capture chain
+    {"key": "global_typing_vktrace","default": False}, # log every keydown VK
 ]
 SETTINGS_BY_KEY = {s["key"]: s for s in SETTINGS_SCHEMA}
 
@@ -136,6 +142,31 @@ def load_settings():
 
 
 settings = load_settings()
+
+# ── One-time trigger migration ───────────────────────────────────────────
+# Early type-anywhere builds defaulted (and SAVED) the trigger as
+# Ctrl+Backspace. Ctrl collides with FFXI's macro palette, so the trigger
+# moved to a bare backtick. Because saved settings override defaults, a
+# user who ran an early build is stuck on Ctrl+Backspace until the JSON is
+# edited by hand. Detect that exact old combo and migrate it once to the
+# new bare-backtick trigger. Only touches the precise legacy values, so a
+# user who DELIBERATELY chose Ctrl+Backspace (or anything else) is left
+# alone — re-pick it after the migration if you truly want it.
+def _migrate_trigger_defaults():
+    changed = False
+    if settings.get("global_typing_key") == "backspace" \
+            and settings.get("global_typing_mod") == "ctrl":
+        settings["global_typing_key"] = "grave"
+        settings["global_typing_mod"] = ""
+        changed = True
+        print("[OmniChat] migrated type-anywhere trigger "
+              "Ctrl+Backspace -> ` (backtick)")
+    if changed:
+        try:
+            save_settings()
+        except Exception:
+            pass
+
 
 
 def save_settings():
@@ -158,6 +189,8 @@ def setting(key):
 def set_setting(key, value):
     settings[key] = value
     save_settings()
+
+_migrate_trigger_defaults()
 
 
 def _import_omniwatch_routing_configs():
@@ -239,10 +272,58 @@ chat_panel_dims = list(setting("chat_panel_dims") or [800, 280])
 chat_panel_dims[0] = max(240, int(chat_panel_dims[0]))
 chat_panel_dims[1] = max(80,  int(chat_panel_dims[1]))
 
+def _virtual_screen_rect():
+    """(left, top, right, bottom) of the whole virtual desktop (all
+    monitors). Windows-only; returns a generous default elsewhere."""
+    if sys.platform != "win32":
+        return (0, 0, 1920, 1080)
+    try:
+        import ctypes
+        u = ctypes.windll.user32
+        SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN = 76, 77
+        SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN = 78, 79
+        x = u.GetSystemMetrics(SM_XVIRTUALSCREEN)
+        y = u.GetSystemMetrics(SM_YVIRTUALSCREEN)
+        w = u.GetSystemMetrics(SM_CXVIRTUALSCREEN)
+        h = u.GetSystemMetrics(SM_CYVIRTUALSCREEN)
+        if w > 0 and h > 0:
+            return (x, y, x + w, y + h)
+    except Exception:
+        pass
+    return (0, 0, 1920, 1080)
+
+
+def _pos_is_reasonable(pos):
+    """True if (x, y) sits within the virtual desktop with a little
+    margin — i.e. NOT the -32000 minimized sentinel and not flung far
+    off every monitor. We require at least a corner of the titlebar-less
+    window to be reachable."""
+    try:
+        x, y = int(pos[0]), int(pos[1])
+    except Exception:
+        return False
+    L, T, R, B = _virtual_screen_rect()
+    # minimized sentinel and anything wildly negative
+    if x <= -10000 or y <= -10000:
+        return False
+    # allow a small overhang, but the top-left must land on-desktop
+    margin = 200
+    return (L - margin) <= x <= (R - 40) and (T - margin) <= y <= (B - 40)
+
+
 _saved_win_pos = setting("window_pos")
 if (isinstance(_saved_win_pos, (list, tuple)) and len(_saved_win_pos) == 2):
-    os.environ["SDL_VIDEO_WINDOW_POS"] = (
-        f"{int(_saved_win_pos[0])},{int(_saved_win_pos[1])}")
+    # Only honor a saved position that's actually on-screen. A position
+    # saved while minimized (-32000,-32000) or otherwise off every
+    # monitor is discarded so the window opens at the OS default spot
+    # instead of invisibly off-screen. (Restore-guard twin of the
+    # save-guard in _persist_window_state.)
+    if _pos_is_reasonable(_saved_win_pos):
+        os.environ["SDL_VIDEO_WINDOW_POS"] = (
+            f"{int(_saved_win_pos[0])},{int(_saved_win_pos[1])}")
+    else:
+        print("[OmniChat] ignoring off-screen saved window position "
+              f"{list(_saved_win_pos)} — opening at default location")
 
 screen = pygame.display.set_mode(tuple(chat_panel_dims), pygame.NOFRAME)
 pygame.display.set_caption("OmniChat")
@@ -303,6 +384,31 @@ def _apply_always_on_top(enabled):
         print(f"[OmniChat] always-on-top failed: {e!r}")
 
 
+def _force_window_shown():
+    """Ensure the overlay window is in a NORMAL (not minimized) visible
+    state at startup. Belt-and-suspenders against the 'opens minimized'
+    case — even if a stale window state or the OS brings us up iconified,
+    this restores and shows us."""
+    if sys.platform != "win32" \
+            or os.environ.get("SDL_VIDEODRIVER") == "dummy":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u = ctypes.windll.user32
+        hwnd = _get_hwnd()
+        if not hwnd:
+            return
+        hwnd_t = wintypes.HWND(hwnd)
+        SW_SHOWNORMAL, SW_RESTORE = 1, 9
+        if u.IsIconic(hwnd_t):
+            u.ShowWindow(hwnd_t, SW_RESTORE)
+        u.ShowWindow(hwnd_t, SW_SHOWNORMAL)
+    except Exception as _e:
+        print(f"[OmniChat] force-show failed: {_e!r}")
+
+
+_force_window_shown()
 _apply_always_on_top(bool(setting("always_on_top")))
 
 
@@ -508,6 +614,407 @@ def _return_keyboard_focus():
 _apply_no_activate(bool(setting("no_focus_steal")))
 
 
+# ── Type-anywhere (global keyboard capture) ──────────────────────────────
+# With the overlay always-on-top and FFXI keeping focus, typing a message
+# normally requires clicking the composer field (which borrows focus).
+# Type-anywhere removes the click: pressing the trigger key while FFXI is
+# the foreground window starts a capture session — a low-level Windows
+# keyboard hook (WH_KEYBOARD_LL, ctypes only, no extra packages, no admin)
+# intercepts every keystroke system-wide, SUPPRESSES it so the game never
+# sees it (no accidental movement / native chat opening), translates it
+# via the active keyboard layout, and feeds it into the composer through
+# the same handlers click-typing uses. Enter sends (the existing UDP
+# "input <cmd>" path to the Lua side), Escape cancels. The session also
+# auto-cancels if focus leaves FFXI (alt-tab safety) or lands on the
+# overlay itself (then SDL delivers keys natively and the hook backing
+# off prevents doubled characters).
+#
+# Toggle: Options ▸ "Type anywhere". Trigger key: settings
+# global_typing_key — named key, default "grave" (the ` key). "enter" is
+# supported but beware: FFXI uses Enter to confirm menus, and the trigger
+# press is swallowed, so only remappers should choose it.
+
+OC_CAPTURE_EVENT = pygame.USEREVENT + 7
+
+_GT_KEYNAME_TO_VK = {
+    "enter": 0x0D, "tab": 0x09, "grave": 0xC0, "backquote": 0xC0,
+    "insert": 0x2D, "pause": 0x13, "scrolllock": 0x91,
+    "backslash": 0xDC, "slash": 0xBF, "semicolon": 0xBA,
+    "quote": 0xDE, "minus": 0xBD, "equals": 0xBB,
+    "backspace": 0x08, "space": 0x20, "delete": 0x2E,
+}
+for _i in range(1, 13):
+    _GT_KEYNAME_TO_VK["f%d" % _i] = 0x6F + _i
+
+_gt_state = {"capturing": False, "thread": None, "debug": False,
+             "hook": None, "proc_ref": None, "vktrace": False,
+             "tid": None, "u32": None, "shutdown": False}
+
+def _gt_trace(msg):
+    """Type-anywhere trace -> session log, gated on global_typing_trace.
+    Turn on by setting \"global_typing_trace\": true in the settings
+    JSON, then read <config>/logs/session_*.log to see the chain:
+    hook install -> trigger seen -> events posted -> events received."""
+    try:
+        if setting("global_typing_trace"):
+            print("[OmniChat][gt] " + str(msg))
+    except Exception:
+        pass
+
+
+def _gt_post(kind, text=""):
+    try:
+        _gt_trace("post -> %s %r" % (kind, text))
+        pygame.event.post(pygame.event.Event(
+            OC_CAPTURE_EVENT, oc_capture=kind, text=text))
+    except Exception as _e:
+        _gt_trace("post FAILED: %r" % (_e,))
+
+
+# Known FFXI client window classes across launchers. Retail/PlayOnline
+# uses "FFXiClass"; some bootloaders/wrappers (Ashita, private-server
+# loaders, windowed-mode shims) report different classes or only a
+# recognizable title. We match generously and, crucially, FALL BACK to
+# "foreground is not our overlay" — because in the intended use the
+# trigger is pressed while the game has focus, so any non-OmniChat
+# foreground window is, by definition of the moment, the thing you're
+# playing. The strict class/title checks above are kept only to AVOID
+# capturing when some OTHER app (browser, Discord) is focused IF we can
+# positively identify the foreground as FFXI; when we can't identify it
+# at all we still allow capture, trading a little over-eagerness for the
+# feature actually working on every launcher. Set global_typing_strict
+# = true to require positive FFXI identification instead.
+_FFXI_CLASSES = ("FFXiClass", "FINAL FANTASY XI", "PlayOnlineViewer")
+
+def _gt_foreground_label(u32, ours):
+    """Return (is_ours, classname, title) for the foreground window."""
+    import ctypes
+    hwnd = u32.GetForegroundWindow()
+    if not hwnd:
+        return (False, "", "", True)   # last field: is_empty
+    is_ours = (hwnd == ours)
+    cls = ctypes.create_unicode_buffer(96)
+    u32.GetClassNameW(hwnd, cls, 96)
+    ttl = ctypes.create_unicode_buffer(160)
+    u32.GetWindowTextW(hwnd, ttl, 160)
+    return (is_ours, cls.value, ttl.value, False)
+
+def _gt_foreground_is_ffxi(u32, ours):
+    """True when we should capture: the foreground is (probably) FFXI and
+    definitely not our own overlay. Permissive by default (see note)."""
+    try:
+        is_ours, cls, ttl, is_empty = _gt_foreground_label(u32, ours)
+        if is_ours or is_empty:
+            return False
+        # positive identification
+        if cls in _FFXI_CLASSES:
+            return True
+        if "final fantasy xi" in (ttl or "").lower():
+            return True
+        # strict mode: require the positive match above
+        if setting("global_typing_strict"):
+            return False
+        # permissive fallback: foreground isn't us and isn't empty —
+        # treat it as the game. This is what makes capture work on
+        # launchers whose window class we don't recognize.
+        return True
+    except Exception:
+        return False
+
+
+def _process_is_elevated():
+    """True if THIS process runs at High integrity (elevated/admin).
+    Used to warn about the UIPI case where a Medium-integrity overlay
+    can't receive a low-level keyboard hook over an elevated game."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        adv = ctypes.WinDLL("advapi32", use_last_error=True)
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        TOKEN_QUERY = 0x0008
+        TokenElevation = 20
+        hproc = k32.GetCurrentProcess()
+        htok = wintypes.HANDLE()
+        if not adv.OpenProcessToken(hproc, TOKEN_QUERY,
+                                    ctypes.byref(htok)):
+            return None
+        try:
+            elev = wintypes.DWORD()
+            ret = wintypes.DWORD()
+            ok = adv.GetTokenInformation(
+                htok, TokenElevation, ctypes.byref(elev),
+                ctypes.sizeof(elev), ctypes.byref(ret))
+            if not ok:
+                return None
+            return bool(elev.value)
+        finally:
+            k32.CloseHandle(htok)
+    except Exception:
+        return None
+
+
+def _gt_hook_thread():
+    """Dedicated thread: install WH_KEYBOARD_LL and pump messages.
+    Runs for the process lifetime; the enabled setting and capture
+    state are consulted per-event, so toggling is instant."""
+    import ctypes
+    from ctypes import wintypes
+    u32 = ctypes.WinDLL("user32", use_last_error=True)
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    # ── Correct ctypes signatures (CRITICAL on 64-bit) ──
+    # Without explicit argtypes/restype, ctypes treats every argument and
+    # return as a C int (32-bit), which TRUNCATES 64-bit pointers: the
+    # HHOOK handle, the lParam pointer to KBDLLHOOKSTRUCT, and window
+    # handles. On a 64-bit frozen build that silently corrupts the hook —
+    # it installs but never delivers usable events, or fails outright with
+    # no error. Declaring the signatures is the fix.
+    HOOKPROC = ctypes.WINFUNCTYPE(
+        ctypes.c_long, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+    u32.SetWindowsHookExW.argtypes = [
+        ctypes.c_int, HOOKPROC, wintypes.HINSTANCE, wintypes.DWORD]
+    u32.SetWindowsHookExW.restype = wintypes.HHOOK
+    u32.CallNextHookEx.argtypes = [
+        wintypes.HHOOK, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM]
+    u32.CallNextHookEx.restype = wintypes.LPARAM
+    u32.GetMessageW.argtypes = [
+        ctypes.POINTER(wintypes.MSG), wintypes.HWND,
+        wintypes.UINT, wintypes.UINT]
+    u32.GetMessageW.restype = ctypes.c_int
+    u32.TranslateMessage.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    u32.DispatchMessageW.argtypes = [ctypes.POINTER(wintypes.MSG)]
+    u32.GetForegroundWindow.restype = wintypes.HWND
+    u32.GetClassNameW.argtypes = [
+        wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    u32.GetClassNameW.restype = ctypes.c_int
+    u32.GetWindowTextW.argtypes = [
+        wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+    u32.GetWindowTextW.restype = ctypes.c_int
+    u32.GetAsyncKeyState.argtypes = [ctypes.c_int]
+    u32.GetAsyncKeyState.restype = ctypes.c_short
+    u32.GetKeyState.argtypes = [ctypes.c_int]
+    u32.GetKeyState.restype = ctypes.c_short
+    u32.GetKeyboardLayout.argtypes = [wintypes.DWORD]
+    u32.GetKeyboardLayout.restype = wintypes.HKL
+    u32.ToUnicodeEx.argtypes = [
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_ubyte),
+        wintypes.LPWSTR, ctypes.c_int, wintypes.UINT, wintypes.HKL]
+    u32.ToUnicodeEx.restype = ctypes.c_int
+    k32.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+    k32.GetModuleHandleW.restype = wintypes.HMODULE
+
+    WH_KEYBOARD_LL = 13
+    WM_KEYDOWN, WM_KEYUP = 0x0100, 0x0101
+    WM_SYSKEYDOWN, WM_SYSKEYUP = 0x0104, 0x0105
+    VK_RETURN, VK_ESCAPE, VK_BACK = 0x0D, 0x1B, 0x08
+    VK_LEFT, VK_RIGHT = 0x25, 0x27
+    VK_SHIFT, VK_CAPITAL = 0x10, 0x14
+    VK_CONTROL, VK_MENU = 0x11, 0x12   # MENU = Alt
+
+    class KBDLLHOOKSTRUCT(ctypes.Structure):
+        _fields_ = [("vkCode", wintypes.DWORD),
+                    ("scanCode", wintypes.DWORD),
+                    ("flags", wintypes.DWORD),
+                    ("time", wintypes.DWORD),
+                    ("dwExtraInfo", ctypes.POINTER(wintypes.ULONG))]
+
+    def translate(vk, sc):
+        """vk -> typed character(s) via the active keyboard layout."""
+        try:
+            state = (ctypes.c_ubyte * 256)()
+            if u32.GetAsyncKeyState(VK_SHIFT) & 0x8000:
+                state[VK_SHIFT] = 0x80
+            # Deliberately do NOT set Ctrl/Alt in the translation state:
+            # we want plain letters even if the user is still holding the
+            # Ctrl from the Ctrl+Backspace trigger. Feeding Ctrl here would
+            # make ToUnicodeEx emit control chars (Ctrl+A -> 0x01) which we
+            # then discard as non-printable, eating the first keystrokes.
+            if u32.GetKeyState(VK_CAPITAL) & 1:
+                state[VK_CAPITAL] = 0x01
+            hkl = u32.GetKeyboardLayout(0)
+            buf = ctypes.create_unicode_buffer(8)
+            n = u32.ToUnicodeEx(vk, sc, state, buf, 8, 0, hkl)
+            if n > 0:
+                s = buf.value[:n]
+                return s if s.isprintable() else ""
+        except Exception:
+            pass
+        return ""
+
+    ours_hwnd = _get_hwnd() or 0
+
+    @HOOKPROC
+    def proc(nCode, wParam, lParam):
+        # Continuous-capture model: when the "Type anywhere" toggle is ON
+        # and FFXI is the foreground window, EVERY keystroke is routed
+        # into OmniChat's composer (and withheld from the game). Toggle
+        # OFF and the hook passes everything straight through — you click
+        # the input box to type, or type in-game normally. There is no
+        # per-message trigger key: the menu toggle is the whole control.
+        if _gt_state.get("shutdown") or nCode < 0 \
+                or not setting("global_typing"):
+            return u32.CallNextHookEx(None, nCode, wParam, lParam)
+        try:
+            kb = ctypes.cast(lParam,
+                             ctypes.POINTER(KBDLLHOOKSTRUCT)).contents
+            vk, sc = kb.vkCode, kb.scanCode
+            is_down = wParam in (WM_KEYDOWN, WM_SYSKEYDOWN)
+            is_up = wParam in (WM_KEYUP, WM_SYSKEYUP)
+
+            # Only capture while the game has focus. If the foreground is
+            # anything else (the overlay itself after a click, alt-tabbed
+            # app, etc.) pass keys through so SDL/other apps get them.
+            fg_ok = _gt_foreground_is_ffxi(u32, ours_hwnd)
+
+            if is_down and _gt_state.get("vktrace"):
+                try:
+                    _io2, _c2, _t2, _e2 = _gt_foreground_label(
+                        u32, ours_hwnd)
+                    _gt_post("debug", "KEYDOWN vk=0x%02X (%d) sc=%d "
+                             "fg_ok=%s fg=%r" % (vk, vk, sc, fg_ok, _c2))
+                except Exception:
+                    pass
+
+            if not fg_ok:
+                # Not capturing right now. If we WERE mid-session, tell the
+                # loop so it drops the caret (keeps any draft text).
+                if _gt_state["capturing"]:
+                    _gt_state["capturing"] = False
+                    _gt_post("cancel_silent")
+                return u32.CallNextHookEx(None, nCode, wParam, lParam)
+
+            # Game is focused and toggle is ON → we are capturing. Open the
+            # session on first captured key so the composer focuses/reveals.
+            if not _gt_state["capturing"]:
+                _gt_state["capturing"] = True
+                _gt_post("start")
+
+            if is_up:
+                return 1              # suppress key-ups while capturing
+            if not is_down:
+                return 1
+
+            if vk == VK_RETURN:
+                # Send, but STAY capturing (toggle is still on) — Enter is
+                # send-and-continue, not an exit. The loop re-arms.
+                _gt_post("submit")
+            elif vk == VK_ESCAPE:
+                # Clear the current draft but keep capturing — ON means
+                # ON. (Use the menu toggle to actually stop.)
+                _gt_post("clear")
+            elif vk == VK_BACK:
+                _gt_post("backspace")
+            elif vk == VK_LEFT:
+                _gt_post("left")
+            elif vk == VK_RIGHT:
+                _gt_post("right")
+            else:
+                ch = translate(vk, sc)
+                if ch:
+                    _gt_post("text", ch)
+            return 1                  # withhold all captured keys from game
+        except Exception:
+            return u32.CallNextHookEx(None, nCode, wParam, lParam)
+
+    _gt_state["vktrace"] = bool(setting("global_typing_vktrace"))
+    _gt_state["proc_ref"] = proc   # prevent GC of the callback
+    hook = u32.SetWindowsHookExW(WH_KEYBOARD_LL, proc,
+                                 k32.GetModuleHandleW(None), 0)
+    _gt_state["hook"] = hook
+    if not hook:
+        print("[OmniChat] type-anywhere: hook install FAILED "
+              f"(err {ctypes.get_last_error()})")
+        return
+    _trig_name = str(setting('global_typing_key')).lower()
+    _trig_vk = _GT_KEYNAME_TO_VK.get(_trig_name, 0xC0)
+    _trig_mod = str(setting('global_typing_mod') or '')
+    print("[OmniChat] type-anywhere: ready (trigger: %s%s = VK 0x%02X)"
+          % (_trig_mod + "+" if _trig_mod else "", _trig_name, _trig_vk))
+    _elev = _process_is_elevated()
+    if _elev is False:
+        print("[OmniChat] type-anywhere: NOTE this process is NOT elevated. "
+              "If FFXI/Windower runs as administrator, Windows (UIPI) will "
+              "BLOCK this keyboard hook from seeing keys while the game has "
+              "focus — and capture will silently do nothing. Fix: run "
+              "OmniChat as administrator too (right-click > Run as "
+              "administrator), or run Windower un-elevated.")
+    elif _elev is True:
+        print("[OmniChat] type-anywhere: process is elevated (admin) — "
+              "good for hooking an elevated game.")
+    _gt_trace("hook installed OK, hHook=%r, elevated=%r, entering loop"
+              % (hook, _elev))
+    u32.GetCurrentThreadId.restype = wintypes.DWORD
+    u32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+    u32.UnhookWindowsHookEx.restype = wintypes.BOOL
+    _gt_state["tid"] = u32.GetCurrentThreadId()
+    _gt_state["u32"] = u32
+    msg = wintypes.MSG()
+    while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:
+        u32.TranslateMessage(ctypes.byref(msg))
+        u32.DispatchMessageW(ctypes.byref(msg))
+    # Pump ended (WM_QUIT) -> release the hook so no keystrokes are ever
+    # withheld after we stop (the "typing dead after close" bug).
+    try:
+        if _gt_state.get("hook"):
+            u32.UnhookWindowsHookEx(_gt_state["hook"])
+            _gt_state["hook"] = None
+            _gt_trace("hook released on thread exit")
+    except Exception:
+        pass
+
+
+def _start_global_typing_hook():
+    if sys.platform != "win32" \
+            or os.environ.get("SDL_VIDEODRIVER") == "dummy":
+        return
+    if _gt_state["thread"] is not None:
+        return
+    import threading
+    t = threading.Thread(target=_gt_hook_thread,
+                         name="oc-global-typing", daemon=True)
+    _gt_state["thread"] = t
+    t.start()
+
+
+def _stop_global_typing_hook():
+    """Cleanly release the keyboard hook and stop its thread on exit —
+    otherwise the low-level hook can linger and SWALLOW keystrokes
+    system-wide until Windows times it out. Posts WM_QUIT to break the
+    pump (the thread then unhooks itself), and unhooks directly as a
+    fallback."""
+    _gt_state["shutdown"] = True   # proc now passes everything through
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        u32 = _gt_state.get("u32") or ctypes.windll.user32
+        tid = _gt_state.get("tid")
+        WM_QUIT = 0x0012
+        if tid:
+            u32.PostThreadMessageW(wintypes.DWORD(tid), WM_QUIT, 0, 0)
+        hook = _gt_state.get("hook")
+        if hook:
+            try:
+                u32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+                u32.UnhookWindowsHookEx.restype = wintypes.BOOL
+            except Exception:
+                pass
+            u32.UnhookWindowsHookEx(hook)
+            _gt_state["hook"] = None
+        print("[OmniChat] type-anywhere: hook released")
+    except Exception as _e:
+        print(f"[OmniChat] type-anywhere: unhook on exit failed: {_e!r}")
+
+
+import atexit as _atexit
+_atexit.register(_stop_global_typing_hook)
+
+_start_global_typing_hook()
+
+
 # Dithered-background cache: one surface per (w, h, pct, theme). A 4x4
 # Bayer matrix gives 16 evenly-distributed transparency levels with no
 # visible banding; rebuilt only when size/opacity/theme changes.
@@ -608,7 +1115,7 @@ def draw_options_popup(surface):
     f = _chat_get_font("meta", 11)
 
     row_h, pad, p_w = 22, 8, 252
-    rows = 9
+    rows = 10
     p_h = pad * 2 + row_h * rows
 
     # Anchor under the Options button; clamp into the window.
@@ -705,10 +1212,17 @@ def draw_options_popup(surface):
     _button("ON" if setting("no_focus_steal") else "OFF", right, 7,
             "toggle_nofocus", w=44)
 
-    # Row 7: exit. The window has no title bar (no [X]), so this and
+    # Row 8: type-anywhere toggle. ON = pressing the trigger key while
+    # FFXI has focus captures keystrokes into the composer (the game
+    # never sees them); Enter sends, Escape cancels.
+    _label("Type anywhere", 8)
+    _button("ON" if setting("global_typing") else "OFF", right, 8,
+            "toggle_global_typing", w=44)
+
+    # Row 9: exit. The window has no title bar (no [X]), so this and
     # Ctrl+Q are the two ways out. Full-width, visually distinct (red
     # tint) so it can't be mistaken for a toggle.
-    exit_r = pygame.Rect(px + pad, _row_y(8) + 1,
+    exit_r = pygame.Rect(px + pad, _row_y(9) + 1,
                          p_w - pad * 2, row_h - 4)
     exit_hov = exit_r.collidepoint(pygame.mouse.get_pos())
     exit_s = pygame.Surface((exit_r.w, exit_r.h), pygame.SRCALPHA)
@@ -790,6 +1304,8 @@ def dispatch_options_popup_click(mx, my):
         elif action == "toggle_composer":
             chat_composer_visible = not chat_composer_visible
             set_setting("chat_composer_visible", chat_composer_visible)
+        elif action == "toggle_global_typing":
+            set_setting("global_typing", not bool(setting("global_typing")))
         elif action == "toggle_nofocus":
             new = not bool(setting("no_focus_steal"))
             set_setting("no_focus_steal", new)
@@ -941,18 +1457,49 @@ def draw_resize_grip(surface, x, y):
 
 # ── Sockets ─────────────────────────────────────────────────────────────────
 
+def _fatal_dialog(title, message):
+    """Show a native Windows message box for a fatal startup error, so
+    the user gets an actionable message instead of a raw traceback
+    crash dialog. No-op off Windows / under the dummy video driver."""
+    if sys.platform != "win32" \
+            or os.environ.get("SDL_VIDEODRIVER") == "dummy":
+        return
+    try:
+        import ctypes
+        MB_OK, MB_ICONERROR, MB_TOPMOST = 0x0, 0x10, 0x40000
+        ctypes.windll.user32.MessageBoxW(
+            0, str(message), str(title),
+            MB_OK | MB_ICONERROR | MB_TOPMOST)
+    except Exception:
+        pass
+
 def _bind_udp(port, label):
     """Non-blocking UDP socket on 127.0.0.1:port with a clear error on
-    collision (most common cause: a second OmniChat overlay running)."""
+    collision (most common cause: a second OmniChat overlay running).
+
+    SO_REUSEADDR lets us re-bind a port whose previous socket is still
+    in the OS's lingering/TIME_WAIT teardown after an unclean exit (the
+    WinError 10048 you hit when relaunching quickly after a crash). It
+    does NOT let two LIVE instances share the port — a genuinely running
+    second overlay still fails here, which is what the friendly message
+    and the GUI dialog below are for."""
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    except OSError:
+        pass
     try:
         s.bind(("127.0.0.1", port))
     except OSError as e:
-        print(f"[OmniChat] FATAL: could not bind UDP port {port} "
-              f"({label}): {e}")
-        print(f"[OmniChat] Another process is already using this port — "
-              f"most likely a second OmniChat overlay. Close it and "
-              f"relaunch.")
+        msg = (f"Could not bind UDP port {port} ({label}).\n\n"
+               f"This almost always means another OmniChat is already "
+               f"running. Close the existing overlay (check the taskbar "
+               f"and system tray), then relaunch.\n\n"
+               f"If you just closed one and relaunched immediately, wait "
+               f"a few seconds for the old socket to release and try "
+               f"again.\n\n({e})")
+        print("[OmniChat] FATAL: " + msg.replace("\n", " "))
+        _fatal_dialog("OmniChat — port in use", msg)
         raise
     s.setblocking(False)
     return s
@@ -1355,7 +1902,6 @@ _chat_composer_rect_channel   = None
 _chat_composer_rect_input     = None
 _chat_composer_rect_tell_to   = None
 _chat_composer_rect_send      = None
-_chat_composer_rect_at        = None  # { } auto-translate wrap button
 
 # Wrap cache: maps (event_id, panel_width) → list[str] of wrapped lines.
 # Invalidated implicitly when panel width changes (different cache key).
@@ -2342,6 +2888,33 @@ def _chat_classify_event(ev):
     if mode in CHAT_MODE_SET_LS2:    return (actor, "chat_ls2")
     if mode in CHAT_MODE_SET_PARTY:  return (actor, "chat_party")
     if mode == 4 or mode == 12:      return (actor, "chat_tell")
+    # Casting-interruption notices ("Wormfood's casting is
+    # interrupted."). FFXI broadcasts one of these for EVERY caster in
+    # range, which buried other players' interrupts in System. One
+    # channel — chat_cast_interrupt — classified with the real actor
+    # (self / party / alliance / mob / other via the name classifier,
+    # with any of your own multibox characters counting as self), so
+    # the per-actor rows in the Filters GUI decide visibility: by
+    # default only YOUR interrupts show (Battle tab); enable the Mob
+    # or Party rows there to see those too.
+    _ci = text.find("'s casting is interrupted")
+    if _ci > 0:
+        _ci_name = text[:_ci].strip()
+        if (_ci_name == player_self_name
+                or _ci_name in _mb_seen_senders):
+            _ci_actor = "self"
+        else:
+            _ci_actor = _chat_classify_name(_ci_name)
+            if _ci_actor == "mob":
+                # The Filters GUI writes mob cells as mob_engaged /
+                # mob_passive; a monster whose interrupt reaches your
+                # battle log is treated as engaged so the GUI's Mob
+                # rows control it.
+                _ci_actor = "mob_engaged"
+        return (_ci_actor, "chat_cast_interrupt")
+    if text.startswith("Your casting is interrupted"):
+        return ("self", "chat_cast_interrupt")
+
     if mode in CHAT_MODE_SET_SYSTEM:
         # Some "system" modes (127 for loot, 131 for exp) carry BOTH
         # the player's own gains AND area-wide gains from OTHER
@@ -2419,6 +2992,15 @@ def _chat_classify_event(ev):
 # specific actor wins over "*".
 
 _CHAT_ROUTING_DEFAULTS = {
+    # Actor-specific overrides (specific actor wins over "*").
+    "self": {
+        # YOUR casting interruptions belong in Battle — that's where
+        # eyes are when a cast gets clipped. Every other actor class
+        # inherits the hidden default from "*" below; flip an actor's
+        # row in the Filters GUI to see that class (e.g. Mob rows for
+        # stun confirmations on bosses).
+        "chat_cast_interrupt": ["Battle"],
+    },
     "*": {
         # Real player chat channels — uniform across actors
         "chat_say":    ["World"],
@@ -2497,6 +3079,13 @@ _CHAT_ROUTING_DEFAULTS = {
         # this to a Custom tab via the routing GUI. Your OWN gains
         # still land in System unchanged.
         "chat_loot_other": [],
+        # Casting-interruption notices: hidden for every actor class
+        # by default — FFXI broadcasts one for each nearby caster and
+        # they're mostly noise. The "self" actor section below
+        # overrides this to Battle for YOUR interrupts; flip any
+        # actor's row in the Filters GUI to see that class (e.g.
+        # enable under Mob to see stun confirmations on bosses).
+        "chat_cast_interrupt": [],
         # Bazaar sale notices ("<Name> bought your <item>...") —
         # informational, default to System. Route to a Custom tab
         # when actively selling if you want a dedicated stream.
@@ -3571,7 +4160,7 @@ def _ingest_chat_packet(raw, stream_label):
         # for the first N chat events. Capped so the session log
         # doesn't bloat under sustained chat. Purpose: when a user
         # reports "filters not working", their session log already
-        # has the routing trace so Cooper can see WHY events landed
+        # has the routing trace showing WHY events landed
         # where they did without needing a reproducer or env var.
         #
         # Logging once-per-event for a short window covers the most
@@ -4887,6 +5476,36 @@ def _chat_composer_handle_textinput(text):
         chat_composer_cursor += len(insert)
 
 
+# ── NPC dialog "continue" arrow ────────────────────────────────────────
+# Each client's OmniChat.lua reports CSSTATE over the event stream
+# (pre-gate, so alts count) whenever it enters/leaves FFXI's Event
+# status — i.e. while an NPC dialog or cutscene is waiting on the
+# player. While the pinned character is in that state, the chat panel
+# draws a small pulsing ▼ at the end of the last line, mirroring the
+# game's own blinking continue cursor: there's more to read — hit
+# Enter in the game to advance.
+_cs_state = {}              # char -> [in_event(bool), last_seen_ts]
+CS_FRESH = 6.0              # seconds a CSSTATE report stays trusted
+
+
+def _dialog_chars():
+    """Characters currently reported in Event status (fresh)."""
+    now = time.time()
+    return sorted(c for c, (on, ts) in _cs_state.items()
+                  if on and (now - ts) <= CS_FRESH)
+
+
+def _chat_continue_arrow_active():
+    """True when the character whose chat the panel shows is sitting
+    in an NPC dialog/cutscene. Falls back to 'anyone' before a pin
+    target exists (brief single-box startup window)."""
+    chars = _dialog_chars()
+    if not chars:
+        return False
+    target = _mb_chat_lock_target() or ""
+    return (target in chars) if target else True
+
+
 def _chat_composer_height():
     """Pixel height of the composer row. Constant — same height
     whether or not the tell target field is showing (the target
@@ -4974,30 +5593,6 @@ def _draw_chat_composer(surface, x, y, w, body_font, meta_font, cjk_font):
                  (arr_r.x + (arr_r.w - ar_surf.get_width()) // 2,
                   arr_r.y + (arr_r.h - ar_surf.get_height()) // 2))
     cx += arrow_w + 4
-
-    # ── { } auto-translate button ───────────────────────────────
-    # Wraps the composer text for auto-translate sending (see the
-    # click handler): with text present, the whole message becomes
-    # {message}; empty, it inserts {} and parks the cursor inside so
-    # you type the phrase directly. The lua side converts {phrase}
-    # into the real in-game auto-translate token on send.
-    global _chat_composer_rect_at
-    at_label = "{ }"
-    at_w = body_font.size(at_label)[0] + 12
-    at_rect = pygame.Rect(cx, y + 3, at_w, h - 6)
-    _chat_composer_rect_at = at_rect
-    _at_hov = at_rect.collidepoint(pygame.mouse.get_pos())
-    at_bg = pygame.Surface((at_rect.w, at_rect.h), pygame.SRCALPHA)
-    at_bg.fill((70, 85, 110, 235) if _at_hov else (46, 54, 68, 225))
-    surface.blit(at_bg, at_rect.topleft)
-    pygame.draw.rect(surface, CHAT_COMPOSER_FIELD_BDR, at_rect, 1)
-    at_surf = body_font.render(at_label, True,
-                               (240, 240, 245) if _at_hov
-                               else (185, 195, 210))
-    surface.blit(at_surf,
-                 (at_rect.x + (at_rect.w - at_surf.get_width()) // 2,
-                  at_rect.y + (at_rect.h - at_surf.get_height()) // 2))
-    cx += at_w + 4
 
     # ── Send button (right-aligned, reserved width) ────────────
     send_label = "send"
@@ -6067,6 +6662,27 @@ def draw_chat_panel(surface, x, y, locked=False):
                                            cjk_font, seg["color"])
             surface.blit(body_surf, (text_x, ly))
 
+    # NPC-dialog continue arrow: a small pulsing ▼ at the end of the
+    # last line while the pinned character is in a dialog/cutscene —
+    # the panel's version of the game's blinking continue cursor.
+    # Only at the live bottom (scrolled up = reading history).
+    if active_scroll == 0 and window and _chat_continue_arrow_active():
+        _bot = window[0]
+        _bplain = _bot.get("spans")
+        _bplain = ("".join(t for t, _ in _bplain) if _bplain
+                   else (_bot.get("text") or ""))
+        try:
+            _aend = text_x + body_font.size(_bplain)[0] + 7
+        except Exception:
+            _aend = text_x
+        _aend = min(_aend, content_x + content_w - 14)
+        _pulse = (math.sin(time.time() * 5.0) + 1.0) * 0.5   # 0..1
+        _aalpha = int(90 + 165 * _pulse)
+        _asurf = meta_font.render("\u25bc", True, (245, 205, 120))
+        _asurf.set_alpha(_aalpha)
+        surface.blit(_asurf, (_aend, bottom_y + (line_h
+                              - _asurf.get_height()) // 2))
+
     # Jump-to-bottom badge: shown when active tab is scrolled up.
     _chat_jump_badge_rect = None
     if active_scroll > 0:
@@ -6356,6 +6972,9 @@ EDGE_BAND = 5                  # px: right/bottom edge single-axis resize bands
 _cur_cursor = None             # last applied system cursor (avoid re-set spam)
 _running = True
 _composer_focus_prev = False   # keep-game-focus edge tracker
+_gt_capturing_active = False   # hook-driven type-anywhere session:
+                               # composer accepts input via the hook,
+                               # WITHOUT taking SDL/OS keyboard focus
 _rt_mtimes = {}                # routing-file mtime watcher state
 _clock = pygame.time.Clock()
 
@@ -6364,9 +6983,16 @@ print(f"[OmniChat] v{OMNICHAT_VERSION} — listening on 127.0.0.1:5113, "
 
 
 def _persist_window_state():
-    """Persist window position + panel dims + composer visibility."""
+    """Persist window position + panel dims + composer visibility.
+
+    A MINIMIZED window reports its position as far off-screen (commonly
+    -32000,-32000 on Windows). Persisting that would relaunch the overlay
+    invisibly off-screen — the "opens minimized and won't come back" bug.
+    So we only save a position that is plausibly on a real monitor; if the
+    window is minimized/off-screen at save time, we keep the LAST good
+    saved position instead of overwriting it with garbage."""
     pos = _get_window_pos()
-    if pos:
+    if pos and _pos_is_reasonable(pos):
         settings["window_pos"] = pos
     settings["chat_panel_dims"] = [int(chat_panel_dims[0]),
                                    int(chat_panel_dims[1])]
@@ -6383,6 +7009,21 @@ while _running:
             raw = cdata.decode("utf-8", errors="replace")
             if not raw:
                 continue
+            # Cutscene-state reports bypass the chat pin: alts in a
+            # dialog count too. Tag format mirrors the gate's.
+            if "CSSTATE\t" in raw[:32]:
+                _cs_sender = ""
+                _cs_payload = raw
+                if raw.startswith("@"):
+                    _cs_end = raw.find("@", 1)
+                    if _cs_end != -1:
+                        _cs_sender = raw[1:_cs_end]
+                        _cs_payload = raw[_cs_end + 1:]
+                if _cs_payload.startswith("CSSTATE\t") and _cs_sender:
+                    _mb_seen_senders.add(_cs_sender)
+                    _cs_on = _cs_payload.split("\t")[1:2] == ["1"]
+                    _cs_state[_cs_sender] = [_cs_on, time.time()]
+                    continue
             # Multibox: chat pins to the configured main character.
             _ok, raw = _mb_gate(raw, for_chat=True)
             if not _ok:
@@ -6443,7 +7084,13 @@ while _running:
     # central hook instead of chasing every focus/unfocus site. When
     # either composer field gains focus we activate the window so
     # typing works; when both lose it we hand focus back to the game.
-    _focus_now = bool(chat_composer_focused or chat_composer_tell_to_focused)
+    # A hook-driven capture session must NOT take SDL focus: the global
+    # keyboard hook delivers keys directly, and SetForegroundWindow on us
+    # would move the foreground off FFXI — which the hook reads as "focus
+    # left the game" and cancels capture. So a session that is ONLY the
+    # hook (no click-focus) is excluded from this edge.
+    _focus_now = bool((chat_composer_focused or chat_composer_tell_to_focused)
+                      and not _gt_capturing_active)
     if setting("no_focus_steal"):
         if _focus_now and not _composer_focus_prev:
             _take_keyboard_focus()
@@ -6482,6 +7129,64 @@ while _running:
         elif event.type == pygame.TEXTINPUT:
             if chat_composer_focused or chat_composer_tell_to_focused:
                 _chat_composer_handle_textinput(event.text)
+
+        elif event.type == OC_CAPTURE_EVENT:
+            # Type-anywhere capture session events from the global
+            # keyboard hook thread. The hook already swallowed the raw
+            # keys (FFXI never saw them); here we feed the composer
+            # through the exact handlers click-typing uses.
+            kind = getattr(event, "oc_capture", "")
+            _gt_trace("recv <- %s %r (active=%s focused=%s)" % (
+                kind, getattr(event, "text", ""),
+                _gt_capturing_active, chat_composer_focused))
+            if kind == "start":
+                # Begin a hook-driven session. We mark the composer
+                # focused for the CARET/visual and to satisfy the
+                # composer's own handlers, but the real gate for hook
+                # input is _gt_capturing_active — which is deliberately
+                # excluded from the take-SDL-focus edge above, so the
+                # overlay never steals foreground from the game.
+                chat_composer_visible = True
+                chat_composer_focused = True
+                chat_composer_tell_to_focused = False
+                _gt_capturing_active = True
+            elif kind == "text":
+                if _gt_capturing_active or chat_composer_focused:
+                    _chat_composer_handle_textinput(event.text)
+            elif kind in ("backspace", "left", "right",
+                          "submit", "clear"):
+                if _gt_capturing_active or chat_composer_focused:
+                    _key = {"backspace": pygame.K_BACKSPACE,
+                            "left": pygame.K_LEFT,
+                            "right": pygame.K_RIGHT,
+                            "submit": pygame.K_RETURN,
+                            "clear": pygame.K_ESCAPE}[kind]
+                    _chat_composer_handle_keydown(
+                        pygame.event.Event(pygame.KEYDOWN, key=_key,
+                                           mod=0, unicode=""))
+                    # Continuous-capture model: with the toggle ON, the
+                    # session never ends from a keystroke. Enter sends and
+                    # keeps capturing; Escape clears the draft (the
+                    # K_ESCAPE handler above already wiped the text) and
+                    # keeps capturing. Both just re-assert the session so
+                    # the very next key still lands in the composer. Only
+                    # the menu toggle (or losing game focus) stops it.
+                    if kind in ("submit", "clear"):
+                        _gt_state["capturing"] = True
+                        _gt_capturing_active = True
+                        chat_composer_focused = True
+            elif kind == "cancel_silent":
+                # Hook reported focus left FFXI mid-capture (alt-tab, or
+                # the overlay itself was clicked). End the hook session;
+                # keep the draft text. If the overlay genuinely has SDL
+                # focus now (a real click), leave chat_composer_focused
+                # so click-typing still works; otherwise drop the caret.
+                _gt_capturing_active = False
+                if not pygame.key.get_focused():
+                    chat_composer_focused = False
+            elif kind == "debug":
+                # Diagnostic line from the hook thread (foreground probe).
+                print("[OmniChat] type-anywhere:", event.text)
 
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
             mx, my = event.pos
@@ -6658,29 +7363,6 @@ while _running:
 
             # Composer clicks — channel arrows, send, field focus.
             if chat_composer_visible:
-                # { } auto-translate button: wrap the message for AT
-                # sending. With text: the whole message becomes
-                # {message} (click again to unwrap). Empty: insert {}
-                # with the cursor parked inside so you type the phrase
-                # directly. Focuses the input either way so typing
-                # continues without another click.
-                if _chat_composer_rect_at is not None \
-                        and _chat_composer_rect_at.collidepoint(mx, my):
-                    _t = chat_composer_text
-                    if not _t:
-                        chat_composer_text = "{}"
-                        chat_composer_cursor = 1
-                    elif _t.startswith("{") and _t.endswith("}") \
-                            and len(_t) >= 2:
-                        # Toggle off: unwrap.
-                        chat_composer_text = _t[1:-1]
-                        chat_composer_cursor = len(chat_composer_text)
-                    else:
-                        chat_composer_text = "{" + _t + "}"
-                        chat_composer_cursor = len(chat_composer_text)
-                    chat_composer_focused = True
-                    chat_composer_tell_to_focused = False
-                    continue
                 if (_chat_composer_rect_arrow_r is not None
                         and _chat_composer_rect_arrow_r.collidepoint(mx, my)) \
                    or (_chat_composer_rect_channel is not None
@@ -6900,5 +7582,7 @@ while _running:
 
 # ── Shutdown ────────────────────────────────────────────────────────
 _persist_window_state()
+_stop_global_typing_hook()   # release the keyboard hook BEFORE we exit,
+                             # so keystrokes are never left swallowed
 pygame.quit()
 print("[OmniChat] exited cleanly.")
