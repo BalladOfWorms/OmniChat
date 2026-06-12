@@ -44,7 +44,7 @@ import collections as _collections
 
 import pygame
 
-OMNICHAT_VERSION = "1.0.3"
+OMNICHAT_VERSION = "1.0.4"
 
 # ── Config / settings ──────────────────────────────────────────────────────
 # One flat JSON file. Mirrors the keys OmniWatch's chat panel reads so
@@ -945,10 +945,16 @@ def _gt_hook_thread():
               "good for hooking an elevated game.")
     _gt_trace("hook installed OK, hHook=%r, elevated=%r, entering loop"
               % (hook, _elev))
-    u32.GetCurrentThreadId.restype = wintypes.DWORD
+    # GetCurrentThreadId is a KERNEL32 export — fetching it off
+    # user32 raised AttributeError and KILLED this thread right
+    # after the hook installed; with no message pump on the
+    # owning thread, Windows never delivered a single hook
+    # callback, so type-anywhere passed every key through to the
+    # game (the 'ready' line printed, making it look healthy).
+    k32.GetCurrentThreadId.restype = wintypes.DWORD
     u32.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
     u32.UnhookWindowsHookEx.restype = wintypes.BOOL
-    _gt_state["tid"] = u32.GetCurrentThreadId()
+    _gt_state["tid"] = k32.GetCurrentThreadId()
     _gt_state["u32"] = u32
     msg = wintypes.MSG()
     while u32.GetMessageW(ctypes.byref(msg), None, 0, 0) != 0:

@@ -2,6 +2,12 @@
 
 All notable changes to OmniChat are documented here. The format is loosely based on [Keep a Changelog](https://keepachangelog.com/), with versions following [semver](https://semver.org/).
 
+## [1.0.4] — 2026-06-12
+
+### Fixed
+
+- **Type-anywhere hook thread crashed on startup (captured nothing)** — the thread fetched GetCurrentThreadId from user32 instead of kernel32, raising AttributeError right after the "ready" line and dying; with no message pump on the owning thread, the keyboard hook never received a callback and every key passed through to the game while the log looked healthy. The lookup now targets kernel32, and all other DLL→function mappings in the hook path were audited clean.
+
 ## [1.0.3] — 2026-06-12
 
 ### Added
